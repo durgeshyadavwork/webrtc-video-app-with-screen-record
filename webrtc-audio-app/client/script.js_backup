@@ -1,0 +1,571 @@
+document.addEventListener('DOMContentLoaded', function() {
+    const startButton = document.getElementById('startButton');
+    const stopButton = document.getElementById('stopButton');
+    const createButton = document.getElementById('createButton');
+    const joinButton = document.getElementById('joinButton');
+    const hangupButton = document.getElementById('hangupButton');
+    const roomInput = document.getElementById('roomInput');
+    const statusText = document.getElementById('statusText');
+    const volumeSlider = document.getElementById('volumeSlider');
+    const volumeValue = document.getElementById('volumeValue');
+    const connectionStatus = document.querySelector('.connection-status');
+    const participantsList = document.getElementById('participantsList');
+    const visualizerBars = document.querySelectorAll('.visualizer .bar');
+    
+    let localStream = null;
+    let roomName = '';
+    let peerConnection = null;
+    let signalingSocket = null;
+    let isCaller = false;
+    let audioContext = null;
+    let analyser = null;
+    let animationFrameId = null;
+    let isMicActive = false;
+    let remoteUserId = null;
+    
+    // WebRTC configuration
+    const configuration = {
+        iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:stun2.l.google.com:19302' },
+            { urls: 'stun:stun3.l.google.com:19302' },
+            { urls: 'stun:stun4.l.google.com:19302' },
+            {
+                urls: 'turn:openrelay.metered.ca:80',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            },
+            {
+                urls: 'turn:openrelay.metered.ca:443',
+                username: 'openrelayproject',
+                credential: 'openrelayproject'
+            }
+        ],
+        iceTransportPolicy: 'all',
+        bundlePolicy: 'max-bundle',
+        rtcpMuxPolicy: 'require'
+    };
+    
+    // Initialize Socket.IO connection
+    function initSignaling() {
+        console.log('Initializing signaling connection to:', window.location.origin);
+        
+        signalingSocket = io(window.location.origin, {
+            transports: ['websocket', 'polling'],
+            reconnection: true,
+            reconnectionAttempts: 5,
+            reconnectionDelay: 1000,
+            timeout: 10000
+        });
+        
+        // Debugging events
+        signalingSocket.on('connect', () => {
+            console.log('✅ Connected to signaling server with ID:', signalingSocket.id);
+            updateStatus('Connected to server', 'connected');
+        });
+        
+        signalingSocket.on('disconnect', (reason) => {
+            console.log('❌ Disconnected from signaling server:', reason);
+            updateStatus('Disconnected from server', 'disconnected');
+        });
+        
+        signalingSocket.on('connect_error', (error) => {
+            console.error('❌ Connection error:', error);
+            updateStatus('Connection error: ' + error.message, 'disconnected');
+        });
+        
+        signalingSocket.on('reconnect', (attempt) => {
+            console.log('🔁 Reconnected after attempt:', attempt);
+            updateStatus('Reconnected to server', 'connected');
+        });
+        
+        // Application events
+        signalingSocket.on('created', (room, id) => {
+            console.log('✅ Room created:', room, 'by server');
+            isCaller = true;
+            updateStatus(`Created room: ${room}. Share this name with others.`, 'connected');
+            updateParticipants([id]);
+        });
+        
+        signalingSocket.on('joined', (room, id) => {
+            console.log('✅ Room joined:', room, 'by server');
+            updateStatus(`Joined room: ${room}. Waiting for call to start...`, 'connected');
+            updateParticipants([id]);
+        });
+        
+        signalingSocket.on('ready', (room) => {
+            console.log('✅ Remote user is ready in room:', room);
+            if (isCaller) {
+                createPeerConnection();
+                createOffer();
+            }
+        });
+        
+        signalingSocket.on('offer', (offer, from) => {
+            console.log('📨 Received offer from:', from);
+            remoteUserId = from;
+            if (!isCaller) {
+                createPeerConnection();
+                handleOffer(offer, from);
+            }
+        });
+        
+        signalingSocket.on('answer', (answer, from) => {
+            console.log('📨 Received answer from:', from);
+            remoteUserId = from;
+            handleAnswer(answer, from);
+        });
+        
+        signalingSocket.on('ice-candidate', (candidate, from) => {
+            console.log('📨 Received ICE candidate from:', from);
+            remoteUserId = from;
+            handleNewICECandidate(candidate, from);
+        });
+        
+        signalingSocket.on('room-full', () => {
+            console.log('❌ Room is full');
+            updateStatus('Room is full. Please try another room.', 'disconnected');
+        });
+        
+        signalingSocket.on('user-left', (userId) => {
+            console.log('👋 User left:', userId);
+            updateStatus('Remote user left the call.', 'disconnected');
+            removeParticipant(userId);
+            hangupCall();
+        });
+        
+        signalingSocket.on('participants-updated', (participants) => {
+            console.log('👥 Participants updated:', participants);
+            updateParticipants(participants);
+            
+            // Find the other user ID for ICE candidates
+            const otherUsers = participants.filter(id => id !== signalingSocket.id);
+            if (otherUsers.length > 0) {
+                remoteUserId = otherUsers[0];
+            }
+        });
+        
+        signalingSocket.on('user-ready', (userId) => {
+            console.log('✅ User ready:', userId);
+            updateStatus('Remote user is ready.', 'connecting');
+        });
+    }
+    
+    // Update status function
+    function updateStatus(status, type) {
+        console.log('📊 Status:', status);
+        statusText.textContent = status;
+        connectionStatus.className = 'connection-status ' + type;
+    }
+    
+    // Update participants list
+    function updateParticipants(participants) {
+        participantsList.innerHTML = '';
+        
+        if (!participants || participants.length === 0) {
+            participantsList.innerHTML = '<div class="participant">No participants yet</div>';
+            return;
+        }
+        
+        participants.forEach(participant => {
+            const participantEl = document.createElement('div');
+            participantEl.className = 'participant';
+            participantEl.innerHTML = `
+                <i class="fas fa-user"></i>
+                User ${participant.substring(0, 8)}
+                ${participant === signalingSocket?.id ? ' (You)' : ''}
+            `;
+            participantsList.appendChild(participantEl);
+        });
+    }
+    
+    // Remove participant
+    function removeParticipant(userId) {
+        const participants = participantsList.querySelectorAll('.participant');
+        participants.forEach(participant => {
+            if (participant.textContent.includes(userId.substring(0, 8))) {
+                participant.remove();
+            }
+        });
+        
+        if (participantsList.children.length === 0) {
+            participantsList.innerHTML = '<div class="participant">No other participants</div>';
+        }
+    }
+    
+    // Create peer connection
+    function createPeerConnection() {
+        console.log('🔗 Creating peer connection');
+        
+        try {
+            peerConnection = new RTCPeerConnection(configuration);
+            
+            // Add local stream to connection
+            if (localStream) {
+                localStream.getTracks().forEach(track => {
+                    console.log('🎵 Adding track:', track.kind);
+                    peerConnection.addTrack(track, localStream);
+                });
+            }
+            
+            // Handle remote stream
+            peerConnection.ontrack = (event) => {
+                console.log('🎧 Remote stream received:', event.streams.length, 'streams');
+                if (event.streams && event.streams[0]) {
+                    // Create audio element for remote stream
+                    const remoteAudio = document.createElement('audio');
+                    remoteAudio.srcObject = event.streams[0];
+                    remoteAudio.autoplay = true;
+                    remoteAudio.controls = false;
+                    remoteAudio.style.display = 'none';
+                    document.body.appendChild(remoteAudio);
+                    
+                    console.log('✅ Audio call connected!');
+                    updateStatus('Call active. Connected to remote user.', 'connected');
+                }
+            };
+            
+            // Handle ICE candidates
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate && remoteUserId) {
+                    console.log('📤 Sending ICE candidate to:', remoteUserId);
+                    signalingSocket.emit('ice-candidate', event.candidate, roomName, remoteUserId);
+                }
+            };
+            
+            // Handle connection state changes
+            peerConnection.onconnectionstatechange = () => {
+                console.log('🔗 Connection state:', peerConnection.connectionState);
+                switch(peerConnection.connectionState) {
+                    case "connected":
+                        updateStatus('Call active. Connected to remote user.', 'connected');
+                        break;
+                    case "disconnected":
+                        updateStatus('Connection lost. Trying to reconnect...', 'connecting');
+                        break;
+                    case "failed":
+                        updateStatus('Connection failed. Please try again.', 'disconnected');
+                        break;
+                    case "closed":
+                        updateStatus('Call ended.', 'disconnected');
+                        break;
+                }
+            };
+            
+            peerConnection.oniceconnectionstatechange = () => {
+                console.log('❄️ ICE connection state:', peerConnection.iceConnectionState);
+            };
+            
+        } catch (error) {
+            console.error('❌ Error creating peer connection:', error);
+            updateStatus('Error creating connection: ' + error.message, 'disconnected');
+        }
+    }
+    
+    // Create audio visualizer
+    function setupAudioVisualizer() {
+        if (!localStream) return;
+        
+        // Stop previous visualizer if running
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+        }
+        
+        try {
+            // Create audio context
+            audioContext = new (window.AudioContext || window.webkitAudioContext)();
+            analyser = audioContext.createAnalyser();
+            const source = audioContext.createMediaStreamSource(localStream);
+            source.connect(analyser);
+            
+            analyser.fftSize = 256;
+            const bufferLength = analyser.frequencyBinCount;
+            const dataArray = new Uint8Array(bufferLength);
+            
+            function visualize() {
+                if (!analyser) return;
+                
+                analyser.getByteFrequencyData(dataArray);
+                
+                // Update visualizer bars
+                const barCount = visualizerBars.length;
+                const step = Math.floor(bufferLength / barCount);
+                
+                for (let i = 0; i < barCount; i++) {
+                    const value = dataArray[i * step] / 255;
+                    const height = Math.max(10, value * 100);
+                    visualizerBars[i].style.height = `${height}%`;
+                    
+                    // Add color effect based on volume
+                    if (value > 0.7) {
+                        visualizerBars[i].style.background = '#f56565';
+                    } else if (value > 0.4) {
+                        visualizerBars[i].style.background = '#ecc94b';
+                    } else {
+                        visualizerBars[i].style.background = '#48bb78';
+                    }
+                }
+                
+                animationFrameId = requestAnimationFrame(visualize);
+            }
+            
+            visualize();
+        } catch (error) {
+            console.error('❌ Error setting up audio visualizer:', error);
+        }
+    }
+    
+    // Create offer
+    async function createOffer() {
+        try {
+            console.log('📤 Creating offer');
+            const offer = await peerConnection.createOffer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: false
+            });
+            
+            await peerConnection.setLocalDescription(offer);
+            console.log('📤 Sending offer to:', remoteUserId);
+            signalingSocket.emit('offer', offer, roomName, remoteUserId);
+        } catch (error) {
+            console.error('❌ Error creating offer:', error);
+            updateStatus('Error creating offer: ' + error.message, 'disconnected');
+        }
+    }
+    
+    // Handle incoming offer
+    async function handleOffer(offer, from) {
+        try {
+            console.log('📨 Handling offer from:', from);
+            remoteUserId = from;
+            await peerConnection.setRemoteDescription(offer);
+            const answer = await peerConnection.createAnswer({
+                offerToReceiveAudio: true,
+                offerToReceiveVideo: false
+            });
+            await peerConnection.setLocalDescription(answer);
+            console.log('📤 Sending answer to:', from);
+            signalingSocket.emit('answer', answer, roomName, from);
+        } catch (error) {
+            console.error('❌ Error handling offer:', error);
+            updateStatus('Error handling offer: ' + error.message, 'disconnected');
+        }
+    }
+    
+    // Handle incoming answer
+    async function handleAnswer(answer, from) {
+        try {
+            console.log('📨 Handling answer from:', from);
+            remoteUserId = from;
+            await peerConnection.setRemoteDescription(answer);
+            console.log('✅ Remote description set successfully');
+        } catch (error) {
+            console.error('❌ Error handling answer:', error);
+            updateStatus('Error handling answer: ' + error.message, 'disconnected');
+        }
+    }
+    
+    // Handle new ICE candidate
+    async function handleNewICECandidate(candidate, from) {
+        try {
+            console.log('📨 Adding ICE candidate from:', from);
+            remoteUserId = from;
+            await peerConnection.addIceCandidate(candidate);
+        } catch (error) {
+            console.error('❌ Error adding ICE candidate:', error);
+        }
+    }
+    
+    // Hang up call
+    function hangupCall() {
+        console.log('📞 Hanging up call');
+        
+        if (peerConnection) {
+            peerConnection.close();
+            peerConnection = null;
+        }
+        
+        if (signalingSocket) {
+            signalingSocket.emit('leave', roomName);
+        }
+        
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
+        
+        // Remove any remote audio elements
+        document.querySelectorAll('audio').forEach(audio => {
+            if (audio.srcObject !== localStream) {
+                audio.remove();
+            }
+        });
+        
+        hangupButton.disabled = true;
+        updateParticipants([]);
+        isCaller = false;
+        remoteUserId = null;
+    }
+    
+    // New helper function for audio setup
+    function setupAudioAfterSuccess() {
+        isMicActive = true;
+        
+        // Set up volume control
+        const audioTracks = localStream.getAudioTracks();
+        if (audioTracks.length > 0) {
+            const audioTrack = audioTracks[0];
+            
+            volumeSlider.addEventListener('input', () => {
+                const volume = volumeSlider.value / 100;
+                volumeValue.textContent = `${volumeSlider.value}%`;
+            });
+        }
+        
+        updateStatus('Microphone active', 'connected');
+        startButton.disabled = true;
+        stopButton.disabled = false;
+        createButton.disabled = false;
+        joinButton.disabled = false;
+        
+        // Set up audio visualization
+        setupAudioVisualizer();
+        
+        // Initialize signaling
+        initSignaling();
+    }
+    
+    // Start audio
+    startButton.addEventListener('click', async () => {
+        try {
+            updateStatus('Accessing microphone...', 'connecting');
+            
+            // Use modern API
+            localStream = await navigator.mediaDevices.getUserMedia({ 
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                    channelCount: 1,
+                    sampleRate: 48000,
+                    sampleSize: 16
+                }, 
+                video: false 
+            });
+            setupAudioAfterSuccess();
+            
+        } catch (error) {
+            console.error('❌ Error accessing microphone:', error);
+            
+            // Show detailed error message
+            if (error.name === 'NotAllowedError') {
+                updateStatus('Microphone permission denied. Please allow microphone access.', 'disconnected');
+            } else if (error.name === 'NotFoundError') {
+                updateStatus('No microphone found. Please connect a microphone.', 'disconnected');
+            } else if (error.name === 'NotReadableError') {
+                updateStatus('Microphone is already in use by another application.', 'disconnected');
+            } else {
+                updateStatus('Error accessing microphone: ' + error.message, 'disconnected');
+            }
+        }
+    });
+    
+    // Stop audio
+    stopButton.addEventListener('click', () => {
+        if (localStream) {
+            localStream.getTracks().forEach(track => track.stop());
+            localStream = null;
+        }
+        
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+            animationFrameId = null;
+        }
+        
+        hangupCall();
+        
+        updateStatus('Microphone stopped', 'disconnected');
+        startButton.disabled = false;
+        stopButton.disabled = true;
+        createButton.disabled = true;
+        joinButton.disabled = true;
+        hangupButton.disabled = true;
+        isMicActive = false;
+        
+        // Reset visualizer
+        visualizerBars.forEach(bar => {
+            bar.style.height = '10%';
+            bar.style.background = '#3a7bd5';
+        });
+    });
+    
+    // Create a room
+    createButton.addEventListener('click', () => {
+        if (!isMicActive) {
+            updateStatus('Please start audio first', 'disconnected');
+            return;
+        }
+        
+        roomName = roomInput.value.trim() || 'room-' + Math.random().toString(36).substring(2, 8);
+        if (!roomName) {
+            updateStatus('Please enter a room name', 'disconnected');
+            return;
+        }
+        
+        updateStatus(`Creating room: ${roomName}...`, 'connecting');
+        signalingSocket.emit('create-or-join-room', roomName);
+        hangupButton.disabled = false;
+    });
+    
+    // Join a room
+    joinButton.addEventListener('click', () => {
+        if (!isMicActive) {
+            updateStatus('Please start audio first', 'disconnected');
+            return;
+        }
+        
+        roomName = roomInput.value.trim();
+        if (!roomName) {
+            updateStatus('Please enter a room name', 'disconnected');
+            return;
+        }
+        
+        updateStatus(`Joining room: ${roomName}...`, 'connecting');
+        signalingSocket.emit('create-or-join-room', roomName);
+        hangupButton.disabled = false;
+        
+        // Notify that we're ready after joining
+        setTimeout(() => {
+            if (signalingSocket && roomName) {
+                signalingSocket.emit('ready', roomName);
+            }
+        }, 1000);
+    });
+    
+    // Hang up the call
+    hangupButton.addEventListener('click', () => {
+        hangupCall();
+        updateStatus('Call ended', 'disconnected');
+    });
+    
+    // Initialize volume display
+    volumeValue.textContent = `${volumeSlider.value}%`;
+    
+    // Add keyboard shortcuts
+    document.addEventListener('keydown', (event) => {
+        if (event.key === 'Enter' && roomInput.value.trim()) {
+            if (createButton.disabled === false) {
+                createButton.click();
+            }
+        }
+        
+        if (event.key === 'Escape') {
+            hangupButton.click();
+        }
+    });
+    
+    console.log('✅ WebRTC Audio App initialized');
+    console.log('🌐 User Agent:', navigator.userAgent);
+});
+

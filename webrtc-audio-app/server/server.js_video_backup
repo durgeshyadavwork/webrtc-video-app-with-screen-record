@@ -1,0 +1,278 @@
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const path = require('path');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+    cors: {
+        origin: "*",
+        methods: ["GET", "POST"]
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+const MAX_USERS_PER_ROOM = 5; // Updated to support 5 users
+
+// Serve static files from the client directory
+app.use(express.static(path.join(__dirname, '../client')));
+
+// Root route - serve index.html
+app.get('/', (req, res) => {
+    res.sendFile(path.join(__dirname, '../client/index.html'));
+});
+
+// Store active rooms
+const rooms = new Map();
+
+// Store socket connections
+const connections = new Map();
+
+io.on('connection', (socket) => {
+    console.log('User connected:', socket.id);
+    console.log('Total users connected:', io.engine.clientsCount);
+    
+    connections.set(socket.id, { 
+        connectedAt: new Date(),
+        ip: socket.handshake.address,
+        userData: null
+    });
+
+    // Handle user metadata (name, etc.)
+    socket.on('user-data', (data) => {
+        const connection = connections.get(socket.id);
+        if (connection) {
+            connection.userData = data;
+            connections.set(socket.id, connection);
+        }
+        
+        // Notify room members about updated user info
+        for (let [roomName, room] of rooms) {
+            if (room.users.includes(socket.id)) {
+                io.to(roomName).emit('user-updated', socket.id, data);
+            }
+        }
+    });
+
+    socket.on('create-or-join-room', (roomName, userData) => {
+        console.log('Create or join room:', roomName, 'by user:', socket.id);
+        
+        const room = rooms.get(roomName) || { users: [], userData: {} };
+        
+        if (room.users.length >= MAX_USERS_PER_ROOM) {
+            console.log('Room is full:', roomName);
+            socket.emit('room-full', roomName);
+            return;
+        }
+
+        room.users.push(socket.id);
+        if (userData) {
+            room.userData[socket.id] = userData;
+        }
+        rooms.set(roomName, room);
+        socket.join(roomName);
+        
+        // Update connection info
+        connections.set(socket.id, { 
+            ...connections.get(socket.id), 
+            room: roomName,
+            joinedAt: new Date()
+        });
+        
+        // Notify all users in the room about updated participants
+        const participants = room.users.map(userId => {
+            return {
+                id: userId,
+                data: room.userData[userId] || { name: `User ${userId.substr(0, 5)}` }
+            };
+        });
+        
+        io.to(roomName).emit('participants-updated', participants);
+        
+        if (room.users.length === 1) {
+            console.log('Room created:', roomName, 'by user:', socket.id);
+            socket.emit('created', roomName, socket.id);
+        } else {
+            console.log('Room joined:', roomName, 'by user:', socket.id);
+            socket.emit('joined', roomName, socket.id);
+            
+            // Notify all other users that someone joined
+            room.users.forEach(userId => {
+                if (userId !== socket.id) {
+                    socket.to(userId).emit('user-joined', socket.id, room.userData[socket.id] || null);
+                }
+            });
+        }
+        
+        console.log('Room', roomName, 'now has', room.users.length, 'users');
+    });
+
+    socket.on('offer', (offer, targetUserId, roomName) => {
+        console.log('Offer from:', socket.id, 'to:', targetUserId, 'room:', roomName);
+        if (targetUserId && socket.id !== targetUserId) {
+            socket.to(targetUserId).emit('offer', offer, socket.id);
+        } else {
+            console.error('Invalid target for offer:', targetUserId);
+        }
+    });
+
+    socket.on('answer', (answer, targetUserId, roomName) => {
+        console.log('Answer from:', socket.id, 'to:', targetUserId, 'room:', roomName);
+        if (targetUserId && socket.id !== targetUserId) {
+            socket.to(targetUserId).emit('answer', answer, socket.id);
+        } else {
+            console.error('Invalid target for answer:', targetUserId);
+        }
+    });
+
+    socket.on('ice-candidate', (candidate, targetUserId, roomName) => {
+        console.log('ICE candidate from:', socket.id, 'to:', targetUserId, 'room:', roomName);
+        if (targetUserId && socket.id !== targetUserId) {
+            socket.to(targetUserId).emit('ice-candidate', candidate, socket.id);
+        } else {
+            console.error('Invalid target for ICE candidate:', targetUserId);
+        }
+    });
+
+    socket.on('ready', (roomName) => {
+        console.log('User ready:', socket.id, 'in room:', roomName);
+        const room = rooms.get(roomName);
+        if (room) {
+            // Notify all other users in the room
+            room.users.forEach(userId => {
+                if (userId !== socket.id) {
+                    socket.to(userId).emit('user-ready', socket.id);
+                }
+            });
+        }
+    });
+
+    socket.on('leave', (roomName) => {
+        console.log('User leaving:', socket.id, 'from room:', roomName);
+        leaveRoom(socket.id, roomName);
+    });
+
+    socket.on('get-rooms', () => {
+        const roomList = [];
+        for (let [roomName, room] of rooms) {
+            roomList.push({
+                name: roomName,
+                users: room.users.length,
+                userList: room.users
+            });
+        }
+        socket.emit('rooms-list', roomList);
+    });
+
+    socket.on('disconnect', (reason) => {
+        console.log('User disconnected:', socket.id, 'Reason:', reason);
+        
+        // Clean up room data when users disconnect
+        for (let [roomName, room] of rooms) {
+            const index = room.users.indexOf(socket.id);
+            if (index !== -1) {
+                // Remove user from room
+                room.users.splice(index, 1);
+                delete room.userData[socket.id];
+                
+                // Notify other users
+                io.to(roomName).emit('user-left', socket.id);
+                
+                if (room.users.length === 0) {
+                    console.log('Deleting empty room:', roomName);
+                    rooms.delete(roomName);
+                } else {
+                    // Update participants list for remaining users
+                    const participants = room.users.map(userId => {
+                        return {
+                            id: userId,
+                            data: room.userData[userId] || { name: `User ${userId.substr(0, 5)}` }
+                        };
+                    });
+                    io.to(roomName).emit('participants-updated', participants);
+                }
+            }
+        }
+        
+        // Remove from connections
+        connections.delete(socket.id);
+        console.log('Total users remaining:', io.engine.clientsCount);
+    });
+
+    function leaveRoom(userId, roomName) {
+        const room = rooms.get(roomName);
+        if (room) {
+            const index = room.users.indexOf(userId);
+            if (index !== -1) {
+                room.users.splice(index, 1);
+                delete room.userData[userId];
+                
+                io.to(roomName).emit('user-left', userId);
+                
+                if (room.users.length === 0) {
+                    console.log('Deleting empty room:', roomName);
+                    rooms.delete(roomName);
+                } else {
+                    // Update participants list for remaining users
+                    const participants = room.users.map(userId => {
+                        return {
+                            id: userId,
+                            data: room.userData[userId] || { name: `User ${userId.substr(0, 5)}` }
+                        };
+                    });
+                    io.to(roomName).emit('participants-updated', participants);
+                }
+            }
+        }
+    }
+});
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({
+        status: 'ok',
+        users: io.engine.clientsCount,
+        rooms: rooms.size,
+        maxUsersPerRoom: MAX_USERS_PER_ROOM,
+        timestamp: new Date().toISOString()
+    });
+});
+
+// Get rooms info endpoint
+app.get('/api/rooms', (req, res) => {
+    const roomList = [];
+    for (let [roomName, room] of rooms) {
+        roomList.push({
+            name: roomName,
+            users: room.users.length,
+            userIds: room.users,
+            userData: room.userData
+        });
+    }
+    res.json(roomList);
+});
+
+// Get connections info endpoint
+app.get('/api/connections', (req, res) => {
+    const connectionList = [];
+    for (let [socketId, info] of connections) {
+        connectionList.push({
+            id: socketId,
+            room: info.room || 'none',
+            connectedAt: info.connectedAt,
+            joinedAt: info.joinedAt || 'not joined',
+            ip: info.ip,
+            userData: info.userData || null
+        });
+    }
+    res.json(connectionList);
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`✅ Video WebRTC server running on port ${PORT}`);
+    console.log(`✅ Supports up to ${MAX_USERS_PER_ROOM} users per room`);
+    console.log(`✅ Health check: http://localhost:${PORT}/health`);
+    console.log(`✅ Rooms API: http://localhost:${PORT}/api/rooms`);
+    console.log(`✅ Connections API: http://localhost:${PORT}/api/connections`);
+});

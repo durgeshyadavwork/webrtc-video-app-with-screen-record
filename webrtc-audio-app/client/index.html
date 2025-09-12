@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Video Conference - WebRTC</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <div class="logo">
+                <i class="fas fa-video"></i> Video Conference
+            </div>
+            <h1>PRP Video Conference</h1>
+            <p class="description">Connect with up to 5 people through peer-to-peer video calls</p>
+        </header>
+        
+        <div class="main-content">
+            <!-- Video Container -->
+            <div class="video-container">
+                <h2><i class="fas fa-users"></i> Participants</h2>
+                <div class="video-grid" id="videoGrid">
+                    <!-- Local video will be added here -->
+                    <!-- Remote videos will be added here -->
+                </div>
+            </div>
+            
+            <!-- Controls Section -->
+            <div class="controls">
+                <div class="control-group">
+                    <h2><i class="fas fa-record-vinyl"></i> Recording</h2>
+                    <div class="button-group">
+                        <button id="startRecording" class="media-btn">
+                            <i class="fas fa-record-vinyl"></i> Start Recording
+                        </button>
+                        <button id="stopRecording" class="media-btn" disabled>
+                            <i class="fas fa-stop"></i> Stop Recording
+                        </button>
+                    </div>
+                    <div id="recordingStatus" style="display: none; margin-top: 10px; padding: 10px; background: #fed7d7; border-radius: 5px;">
+                        <i class="fas fa-circle" style="color: red;"></i>
+                        <span>Recording in progress...</span>
+                    </div>
+                </div>
+                
+                <div class="control-group">
+                    <h2><i class="fas fa-sliders-h"></i> Media Controls</h2>
+                    
+                    <div class="button-group">
+                        <button id="startButton">
+                            <i class="fas fa-play-circle"></i> Start Media
+                        </button>
+                        <button id="stopButton" disabled>
+                            <i class="fas fa-stop-circle"></i> Stop Media
+                        </button>
+                    </div>
+                    
+                    <div class="media-controls">
+                        <button id="toggleVideo" class="media-btn active">
+                            <i class="fas fa-video"></i> Video On
+                        </button>
+                        <button id="toggleAudio" class="media-btn active">
+                            <i class="fas fa-microphone"></i> Audio On
+                        </button>
+                        <button id="screenShare" class="media-btn">
+                            <i class="fas fa-desktop"></i> Share Screen
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="control-group">
+                    <h2><i class="fas fa-door-open"></i> Room Management</h2>
+                    
+                    <input type="text" id="roomInput" placeholder="Enter room name">
+                    
+                    <div class="button-group">
+                        <button id="createButton" class="call-button">
+                            <i class="fas fa-plus-circle"></i> Create Room
+                        </button>
+                        <button id="joinButton" class="call-button">
+                            <i class="fas fa-sign-in-alt"></i> Join Room
+                        </button>
+                        <button id="hangupButton" class="end-call-button" disabled>
+                            <i class="fas fa-phone-slash"></i> Leave Call
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="control-group">
+                    <h2><i class="fas fa-network-wired"></i> Connection Status</h2>
+                    <div class="status">
+                        <span class="connection-status disconnected"></span>
+                        <span id="statusText">Disconnected</span>
+                    </div>
+                    <div class="participant-count">
+                        <i class="fas fa-users"></i>
+                        <span id="participantCount">0</span>/5 participants
+                    </div>
+                </div>
+                
+                <div class="control-group">
+                    <h2><i class="fas fa-user-friends"></i> Participants</h2>
+                    <div id="participantsList">
+                        <div class="participant">No participants yet</div>
+                    </div>
+                </div>
+                
+                <div class="control-group">
+                    <h2><i class="fas fa-info-circle"></i> How to Use</h2>
+                    <ol class="steps">
+                        <li>Click "Start Media" to enable your camera and microphone</li>
+                        <li>Create a room or join an existing one with a room name</li>
+                        <li>Share the room name with people you want to invite (max 5)</li>
+                        <li>Wait for participants to join</li>
+                        <li>Click "Leave Call" when finished</li>
+                    </ol>
+                </div>
+            </div>
+        </div>
+        
+        <footer>
+            <p>Video Conference WebRTC Application | Built with HTML, CSS, and JavaScript</p>
+        </footer>
+    </div>
+
+    <!-- Templates for video elements -->
+    <template id="localVideoTemplate">
+        <div class="video-item local-video">
+            <video id="localVideo" autoplay muted playsinline></video>
+            <div class="video-overlay">
+                <span class="user-name">You</span>
+                <div class="video-status">
+                    <i class="fas fa-microphone"></i>
+                    <i class="fas fa-video"></i>
+                </div>
+            </div>
+        </div>
+    </template>
+    
+    <template id="remoteVideoTemplate">
+        <div class="video-item remote-video">
+            <video autoplay playsinline></video>
+            <div class="video-overlay">
+                <span class="user-name">Remote User</span>
+                <div class="video-status">
+                    <i class="fas fa-microphone"></i>
+                    <i class="fas fa-video"></i>
+                </div>
+            </div>
+        </div>
+    </template>
+
+    <script src="/socket.io/socket.io.js"></script>
+    <script src="script.js"></script>
+</body>
+</html>

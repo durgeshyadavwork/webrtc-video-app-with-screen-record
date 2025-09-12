@@ -1,0 +1,198 @@
+const db = require('./db');
+
+// Initialize database tables
+async function initDatabase() {
+  try {
+    // Create rooms table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS rooms (
+        id SERIAL PRIMARY KEY,
+        room_id VARCHAR(255) UNIQUE NOT NULL,
+        name VARCHAR(255),
+        created_by VARCHAR(255),
+        max_participants INTEGER DEFAULT 5,
+        participant_count INTEGER DEFAULT 0,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Create recordings table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS recordings (
+        id SERIAL PRIMARY KEY,
+        recording_id VARCHAR(255) UNIQUE NOT NULL,
+        room_id VARCHAR(255) NOT NULL,
+        file_name VARCHAR(255) NOT NULL,
+        file_path VARCHAR(500) NOT NULL,
+        file_size BIGINT,
+        duration INTEGER,
+        participants TEXT[],
+        created_by VARCHAR(255),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (room_id) REFERENCES rooms(room_id) ON DELETE CASCADE
+      )
+    `);
+
+    // Create participants table
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS participants (
+        id SERIAL PRIMARY KEY,
+        participant_id VARCHAR(255) NOT NULL,
+        room_id VARCHAR(255) NOT NULL,
+        user_name VARCHAR(255),
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        left_at TIMESTAMP,
+        duration INTEGER,
+        FOREIGN KEY (room_id) REFERENCES rooms(room_id) ON DELETE CASCADE
+      )
+    `);
+
+    console.log('✅ Database tables initialized successfully');
+  } catch (error) {
+    console.error('❌ Error initializing database:', error);
+  }
+}
+
+// Room management functions
+async function createRoom(roomId, roomName, createdBy, maxParticipants = 5) {
+  try {
+    const result = await db.query(
+      'INSERT INTO rooms (room_id, name, created_by, max_participants) VALUES ($1, $2, $3, $4) RETURNING *',
+      [roomId, roomName, createdBy, maxParticipants]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error('Error creating room:', error);
+    throw error;
+  }
+}
+
+async function getRoom(roomId) {
+  try {
+    const result = await db.query('SELECT * FROM rooms WHERE room_id = $1', [roomId]);
+    return result.rows[0];
+  } catch (error) {
+    console.error('Error getting room:', error);
+    throw error;
+  }
+}
+
+async function updateParticipantCount(roomId, count) {
+  try {
+    await db.query(
+      'UPDATE rooms SET participant_count = $1, updated_at = CURRENT_TIMESTAMP WHERE room_id = $2',
+      [count, roomId]
+    );
+  } catch (error) {
+    console.error('Error updating participant count:', error);
+    throw error;
+  }
+}
+
+async function closeRoom(roomId) {
+  try {
+    await db.query(
+      'UPDATE rooms SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE room_id = $1',
+      [roomId]
+    );
+  } catch (error) {
+    console.error('Error closing room:', error);
+    throw error;
+  }
+}
+
+// Recording functions
+async function saveRecording(recordingData) {
+  try {
+    const { recordingId, roomId, fileName, filePath, fileSize, duration, participants, createdBy } = recordingData;
+    
+    const result = await db.query(
+      `INSERT INTO recordings 
+      (recording_id, room_id, file_name, file_path, file_size, duration, participants, created_by) 
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING *`,
+      [recordingId, roomId, fileName, filePath, fileSize, duration, participants, createdBy]
+    );
+    
+    return result.rows[0];
+  } catch (error) {
+    console.error('Error saving recording:', error);
+    throw error;
+  }
+}
+
+async function getRecordings(roomId = null) {
+  try {
+    let query = 'SELECT * FROM recordings';
+    let params = [];
+    
+    if (roomId) {
+      query += ' WHERE room_id = $1';
+      params.push(roomId);
+    }
+    
+    query += ' ORDER BY created_at DESC';
+    
+    const result = await db.query(query, params);
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting recordings:', error);
+    throw error;
+  }
+}
+
+// Participant functions
+async function addParticipant(participantId, roomId, userName = null) {
+  try {
+    const result = await db.query(
+      'INSERT INTO participants (participant_id, room_id, user_name) VALUES ($1, $2, $3) RETURNING *',
+      [participantId, roomId, userName]
+    );
+    return result.rows[0];
+  } catch (error) {
+    console.error('Error adding participant:', error);
+    throw error;
+  }
+}
+
+async function updateParticipantLeftTime(participantId, roomId) {
+  try {
+    await db.query(
+      `UPDATE participants 
+       SET left_at = CURRENT_TIMESTAMP, 
+           duration = EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - joined_at)) 
+       WHERE participant_id = $1 AND room_id = $2 AND left_at IS NULL`,
+      [participantId, roomId]
+    );
+  } catch (error) {
+    console.error('Error updating participant left time:', error);
+    throw error;
+  }
+}
+
+async function getRoomParticipants(roomId) {
+  try {
+    const result = await db.query(
+      'SELECT * FROM participants WHERE room_id = $1 ORDER BY joined_at DESC',
+      [roomId]
+    );
+    return result.rows;
+  } catch (error) {
+    console.error('Error getting room participants:', error);
+    throw error;
+  }
+}
+
+module.exports = {
+  initDatabase,
+  createRoom,
+  getRoom,
+  updateParticipantCount,
+  closeRoom,
+  saveRecording,
+  getRecordings,
+  addParticipant,
+  updateParticipantLeftTime,
+  getRoomParticipants,
+};

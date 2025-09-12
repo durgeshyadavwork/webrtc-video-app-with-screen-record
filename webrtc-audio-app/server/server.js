@@ -1,0 +1,500 @@
+// Dotenv for environment variables
+require('dotenv').config();
+
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const path = require('path');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const { v4: uuidv4 } = require('uuid');
+
+// Database and models
+const db = require('./database/db');
+const {
+  initDatabase,
+  createRoom,
+  getRoom,
+  updateParticipantCount,
+  closeRoom,
+  saveRecording,
+  addParticipant,
+  updateParticipantLeftTime
+} = require('./database/models');
+
+// Routes
+const apiRoutes = require('./routes/api');
+const recordingRoutes = require('./routes/recordings');
+
+const app = express();
+const server = http.createServer(app);
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
+});
+
+const PORT = process.env.PORT || 3000;
+const MAX_USERS_PER_ROOM = 5;
+
+// Middleware
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true }));
+
+// Trust proxy for rate limiting
+app.set('trust proxy', 1);
+
+// Rate limiting
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100 // limit each IP to 100 requests per windowMs
+});
+app.use(limiter);
+
+// Serve static files
+app.use(express.static(path.join(__dirname, '../client')));
+
+// API routes
+app.use('/api', apiRoutes);
+app.use('/api/recordings', recordingRoutes);
+
+// Root route
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '../client/index.html'));
+});
+
+// Create room page - Redirect to room with auto-start
+app.get('/create-room', (req, res) => {
+  const roomName = req.query.name || `room-${Math.random().toString(36).substring(2, 8)}`;
+  const maxParticipants = parseInt(req.query.max) || 5;
+
+  if (!rooms.has(roomName)) {
+    rooms.set(roomName, {
+      users: [],
+      userData: {},
+      createdAt: new Date()
+    });
+  }
+
+  // Redirect to room with auto-start parameters
+  res.redirect(`/?room=${roomName}&autostart=true`);
+});
+
+// New meeting with auto-start
+app.get('/new-meeting', (req, res) => {
+  const roomId = `meeting-${Math.random().toString(36).substring(2, 8)}`;
+  rooms.set(roomId, { users: [], userData: {}, createdAt: new Date() });
+  res.redirect(`/?room=${roomId}&autostart=true`);
+});
+
+// Store active rooms and connections
+const rooms = new Map();
+const connections = new Map();
+
+// Initialize database
+initDatabase();
+
+// Socket.IO connection handling
+io.on('connection', (socket) => {
+  console.log('User connected:', socket.id);
+  
+  connections.set(socket.id, { 
+    connectedAt: new Date(),
+    ip: socket.handshake.address,
+    userData: null
+  });
+
+  // Handle user metadata
+  socket.on('user-data', async (data) => {
+    const connection = connections.get(socket.id);
+    if (connection) {
+      connection.userData = data;
+      connections.set(socket.id, connection);
+    }
+    
+    // Notify room members about updated user info
+    for (let [roomName, room] of rooms) {
+      if (room.users.includes(socket.id)) {
+        socket.to(roomName).emit('user-updated', { userId: socket.id, userData: data });
+      }
+    }
+  });
+
+  // Create or join room
+  socket.on('create-or-join-room', async (roomName, userData) => {
+    try {
+      console.log('Create or join room:', roomName, 'by user:', socket.id);
+      
+      let room = rooms.get(roomName);
+      
+      // Check if room exists in database
+      const dbRoom = await getRoom(roomName);
+      
+      if (!room && dbRoom) {
+        // Room exists in DB but not in memory, recreate it
+        room = { users: [], userData: {} };
+        rooms.set(roomName, room);
+      }
+      
+      if (!room) {
+        room = { users: [], userData: {} };
+      }
+      
+      if (room.users.length >= MAX_USERS_PER_ROOM) {
+        console.log('Room is full:', roomName);
+        socket.emit('room-full', { room: roomName });
+        return;
+      }
+
+      // Add user to room
+      room.users.push(socket.id);
+      if (userData) {
+        room.userData[socket.id] = userData;
+      }
+      rooms.set(roomName, room);
+      socket.join(roomName);
+      
+      // Update connection info
+      connections.set(socket.id, { 
+        ...connections.get(socket.id), 
+        room: roomName,
+        joinedAt: new Date()
+      });
+      
+      // Update database
+      if (!dbRoom) {
+        // Create new room in database
+        await createRoom(roomName, roomName, socket.id, MAX_USERS_PER_ROOM);
+      }
+      
+      // Add participant to database
+      await addParticipant(socket.id, roomName, userData?.name || `User ${socket.id.substring(0, 5)}`);
+      
+      // Update participant count
+      await updateParticipantCount(roomName, room.users.length);
+      
+      // Notify all users in the room about updated participants
+      const participants = room.users.map(userId => {
+        return {
+          id: userId,
+          data: room.userData[userId] || { name: `User ${userId.substr(0, 5)}` }
+        };
+      });
+      
+      io.to(roomName).emit('participants-updated', { participants });
+      
+      if (room.users.length === 1) {
+        console.log('Room created:', roomName, 'by user:', socket.id);
+        socket.emit('created', { room: roomName, id: socket.id });
+        
+        // Set user as caller (will create offers for new users)
+        connections.get(socket.id).isCaller = true;
+      } else {
+        console.log('Room joined:', roomName, 'by user:', socket.id);
+        socket.emit('joined', { room: roomName, id: socket.id });
+        
+        // Notify all other users that someone joined
+        socket.to(roomName).emit('user-joined', { 
+          userId: socket.id, 
+          userData: room.userData[socket.id] || null 
+        });
+        
+        // Existing users should create offers for the new user
+        room.users.forEach(userId => {
+          if (userId !== socket.id) {
+            const userConnection = connections.get(userId);
+            if (userConnection && userConnection.isCaller) {
+              socket.to(userId).emit('create-offer', { targetUserId: socket.id, roomName });
+            }
+          }
+        });
+      }
+      
+      console.log('Room', roomName, 'now has', room.users.length, 'users');
+    } catch (error) {
+      console.error('Error in create-or-join-room:', error);
+      socket.emit('error', { error: 'Failed to join room' });
+    }
+  });
+
+  // WebRTC signaling events - FIXED VERSION
+  socket.on('offer', (data) => {
+    const { offer, to, roomId } = data;
+    console.log('Offer from:', socket.id, 'to:', to, 'room:', roomId);
+    if (to && socket.id !== to) {
+      socket.to(to).emit('offer', { offer, from: socket.id, roomId });
+    }
+  });
+
+  socket.on('answer', (data) => {
+    const { answer, to, roomId } = data;
+    console.log('Answer from:', socket.id, 'to:', to, 'room:', roomId);
+    if (to && socket.id !== to) {
+      socket.to(to).emit('answer', { answer, from: socket.id, roomId });
+    }
+  });
+
+  socket.on('ice-candidate', (data) => {
+    const { candidate, to, roomId } = data;
+    console.log('ICE candidate from:', socket.id, 'to:', to, 'room:', roomId);
+    if (to && socket.id !== to) {
+      socket.to(to).emit('ice-candidate', { candidate, from: socket.id, roomId });
+    }
+  });
+
+  // Recording control - FIXED VERSION
+  socket.on('start-recording', async (data) => {
+    try {
+      const { roomId, roomName } = data;
+      const actualRoomName = roomId || roomName;
+      
+      console.log('Start recording requested for room:', actualRoomName);
+      
+      // Ensure room exists
+      if (!rooms.has(actualRoomName)) {
+        throw new Error(`Room ${actualRoomName} does not exist`);
+      }
+      
+      const recordingId = uuidv4();
+      
+      io.to(actualRoomName).emit('recording-started', { 
+        recordingId,
+        startedBy: socket.id,
+        timestamp: new Date().toISOString()
+      });
+      
+      // Send confirmation to the requester
+      socket.emit('recording-start-confirm', { 
+        success: true, 
+        recordingId 
+      });
+      
+    } catch (error) {
+      console.error('Error starting recording:', error);
+      socket.emit('recording-error', { error: 'Failed to start recording: ' + error.message });
+    }
+  });
+
+  socket.on('stop-recording', async (data) => {
+    try {
+      const { roomId, roomName, recordingId, duration, participants } = data;
+      const actualRoomName = roomId || roomName;
+      
+      console.log('Stop recording requested for room:', actualRoomName);
+      
+      // Ensure roomId is provided
+      if (!actualRoomName) {
+        throw new Error('roomId or roomName is required for recording');
+      }
+      
+      // Ensure room exists
+      if (!rooms.has(actualRoomName)) {
+        throw new Error(`Room ${actualRoomName} does not exist`);
+      }
+      
+      // Save recording metadata to database
+      if (recordingId) {
+        await saveRecording({
+          recording_id: recordingId,
+          room_id: actualRoomName,
+          room_name: roomName,
+          duration: duration || 0,
+          participants: participants || [socket.id],
+          created_by: socket.id
+        });
+      }
+      
+      io.to(actualRoomName).emit('recording-stopped', {
+        recordingId,
+        stoppedBy: socket.id,
+        timestamp: new Date().toISOString()
+      });
+      
+      // Send success response to the requester
+      socket.emit('recording-stop-confirm', { 
+        success: true, 
+        recordingId
+      });
+      
+    } catch (error) {
+      console.error('Error stopping recording:', error);
+      socket.emit('recording-error', { error: 'Failed to stop recording: ' + error.message });
+    }
+  });
+
+  // Create offer for specific user
+  socket.on('create-offer', (data) => {
+    const { targetUserId, roomName } = data;
+    console.log('Create offer request from:', socket.id, 'to:', targetUserId, 'room:', roomName);
+    if (targetUserId && socket.id !== targetUserId) {
+      socket.to(targetUserId).emit('create-offer', { from: socket.id, roomName });
+    }
+  });
+
+  // Leave room
+  socket.on('leave', async (roomName) => {
+    console.log('User leaving:', socket.id, 'from room:', roomName);
+    await leaveRoom(socket.id, roomName);
+  });
+
+  // Get rooms list
+  socket.on('get-rooms', async () => {
+    try {
+      const roomList = [];
+      for (let [roomName, room] of rooms) {
+        roomList.push({
+          name: roomName,
+          users: room.users.length,
+          userList: room.users
+        });
+      }
+      socket.emit('rooms-list', { rooms: roomList });
+    } catch (error) {
+      console.error('Error getting rooms list:', error);
+    }
+  });
+
+  // Disconnect
+  socket.on('disconnect', async (reason) => {
+    console.log('User disconnected:', socket.id, 'Reason:', reason);
+    
+    // Clean up room data when users disconnect
+    for (let [roomName, room] of rooms) {
+      const index = room.users.indexOf(socket.id);
+      if (index !== -1) {
+        // Remove user from room
+        room.users.splice(index, 1);
+        delete room.userData[socket.id];
+        
+        // Update participant left time in database
+        await updateParticipantLeftTime(socket.id, roomName);
+        
+        // Update participant count in database
+        await updateParticipantCount(roomName, room.users.length);
+        
+        // Notify other users
+        io.to(roomName).emit('user-left', { userId: socket.id });
+        
+        if (room.users.length === 0) {
+          console.log('Deleting empty room:', roomName);
+          // Close room in database
+          await closeRoom(roomName);
+          rooms.delete(roomName);
+        } else {
+          // Update participants list for remaining users
+          const participants = room.users.map(userId => {
+            return {
+              id: userId,
+              data: room.userData[userId] || { name: `User ${userId.substr(0, 5)}` }
+            };
+          });
+          io.to(roomName).emit('participants-updated', { participants });
+        }
+      }
+    }
+    
+    // Remove from connections
+    connections.delete(socket.id);
+    console.log('Total users remaining:', io.engine.clientsCount);
+  });
+
+  // Leave room function
+  async function leaveRoom(userId, roomName) {
+    const room = rooms.get(roomName);
+    if (room) {
+      const index = room.users.indexOf(userId);
+      if (index !== -1) {
+        room.users.splice(index, 1);
+        delete room.userData[userId];
+        
+        // Update database
+        await updateParticipantLeftTime(userId, roomName);
+        await updateParticipantCount(roomName, room.users.length);
+        
+        io.to(roomName).emit('user-left', { userId: userId });
+        
+        if (room.users.length === 0) {
+          console.log('Deleting empty room:', roomName);
+          await closeRoom(roomName);
+          rooms.delete(roomName);
+        } else {
+          const participants = room.users.map(userId => {
+            return {
+              id: userId,
+              data: room.userData[userId] || { name: `User ${userId.substr(0, 5)}` }
+            };
+          });
+          io.to(roomName).emit('participants-updated', { participants });
+        }
+      }
+    }
+  }
+});
+
+// Health check endpoint
+app.get('/health', async (req, res) => {
+  try {
+    // Test database connection
+    await db.query('SELECT 1');
+    res.json({
+      status: 'ok',
+      users: io.engine.clientsCount,
+      rooms: rooms.size,
+      maxUsersPerRoom: MAX_USERS_PER_ROOM,
+      timestamp: new Date().toISOString(),
+      database: 'connected'
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: 'error',
+      error: error.message,
+      database: 'disconnected'
+    });
+  }
+});
+
+// API documentation endpoint
+app.get('/api/docs', (req, res) => {
+  res.sendFile(path.join(__dirname, 'api-docs.html'));
+});
+
+// Get room info endpoint
+app.get('/api/room/:roomId', (req, res) => {
+  const roomId = req.params.roomId;
+  const room = rooms.get(roomId);
+  
+  if (!room) {
+    return res.status(404).json({ error: 'Room not found' });
+  }
+  
+  res.json({
+    roomId: roomId,
+    participants: room.users,
+    participantCount: room.users.length,
+    createdAt: new Date().toISOString()
+  });
+});
+
+// Error handling middleware
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`✅ Video WebRTC server running on port ${PORT}`);
+  console.log(`✅ Supports up to ${MAX_USERS_PER_ROOM} users per room`);
+  console.log(`✅ Health check: http://localhost:${PORT}/health`);
+  console.log(`✅ API documentation: http://localhost:${PORT}/api/docs`);
+});
+
+// Graceful shutdown
+process.on('SIGINT', () => {
+  console.log('\nShutting down server...');
+  server.close(() => {
+    console.log('Server stopped');
+    process.exit(0);
+  });
+});
